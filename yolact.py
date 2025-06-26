@@ -1,4 +1,4 @@
-import torch, torchvision
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models.resnet import Bottleneck
@@ -11,13 +11,12 @@ from utils.augmentations import FastBaseTransform
 
 from data.config import cfg, mask_type
 from layers import Detect
-from layers.interpolate import InterpolateModule
 from backbone import construct_backbone
 from layers.output_utils import postprocess
 
 import torch.backends.cudnn as cudnn
 from utils import timer
-from utils.functions import MovingAverage, make_net
+from utils.functions import make_net
 import cv2
 # This is required for Pytorch 1.0.1 on Windows to initialize Cuda on some driver versions.
 # See the bug report here: https://github.com/pytorch/pytorch/issues/17108
@@ -475,9 +474,7 @@ class Yolact(nn.Module):
         self.eval() 
         self.cuda()
 
-    def save_weights(self, path):
-        """ Saves the model's weights using compression because the file sizes were getting too big. """
-        torch.save(self.state_dict(), path)
+
     
     def load_weights(self, path):
         """ Loads weights from a compressed save file. """
@@ -494,77 +491,6 @@ class Yolact(nn.Module):
                     del state_dict[key]
         self.load_state_dict(state_dict)
 
-    def init_weights(self, backbone_path):
-        """ Initialize weights for training. """
-        # Initialize the backbone with the pretrained weights.
-        self.backbone.init_backbone(backbone_path)
-
-        conv_constants = getattr(nn.Conv2d(1, 1, 1), '__constants__')
-        
-        # Quick lambda to test if one list contains the other
-        def all_in(x, y):
-            for _x in x:
-                if _x not in y:
-                    return False
-            return True
-
-        # Initialize the rest of the conv layers with xavier
-        for name, module in self.named_modules():
-            # See issue #127 for why we need such a complicated condition if the module is a WeakScriptModuleProxy
-            # Broke in 1.3 (see issue #175), WeakScriptModuleProxy was turned into just ScriptModule.
-            # Broke in 1.4 (see issue #292), where RecursiveScriptModule is the new star of the show.
-            # Note that this might break with future pytorch updates, so let me know if it does
-            is_script_conv = False
-            if 'Script' in type(module).__name__:
-                # 1.4 workaround: now there's an original_name member so just use that
-                if hasattr(module, 'original_name'):
-                    is_script_conv = 'Conv' in module.original_name
-                # 1.3 workaround: check if this has the same constants as a conv module
-                else:
-                    is_script_conv = (
-                        all_in(module.__dict__['_constants_set'], conv_constants)
-                        and all_in(conv_constants, module.__dict__['_constants_set']))
-            
-            is_conv_layer = isinstance(module, nn.Conv2d) or is_script_conv
-
-            if is_conv_layer and module not in self.backbone.backbone_modules:
-                nn.init.xavier_uniform_(module.weight.data)
-
-                if module.bias is not None:
-                    if cfg.use_focal_loss and 'conf_layer' in name:
-                        if not cfg.use_sigmoid_focal_loss:
-                            # Initialize the last layer as in the focal loss paper.
-                            # Because we use softmax and not sigmoid, I had to derive an alternate expression
-                            # on a notecard. Define pi to be the probability of outputting a foreground detection.
-                            # Then let z = sum(exp(x)) - exp(x_0). Finally let c be the number of foreground classes.
-                            # Chugging through the math, this gives us
-                            #   x_0 = log(z * (1 - pi) / pi)    where 0 is the background class
-                            #   x_i = log(z / c)                for all i > 0
-                            # For simplicity (and because we have a degree of freedom here), set z = 1. Then we have
-                            #   x_0 =  log((1 - pi) / pi)       note: don't split up the log for numerical stability
-                            #   x_i = -log(c)                   for all i > 0
-                            module.bias.data[0]  = np.log((1 - cfg.focal_loss_init_pi) / cfg.focal_loss_init_pi)
-                            module.bias.data[1:] = -np.log(module.bias.size(0) - 1)
-                        else:
-                            module.bias.data[0]  = -np.log(cfg.focal_loss_init_pi / (1 - cfg.focal_loss_init_pi))
-                            module.bias.data[1:] = -np.log((1 - cfg.focal_loss_init_pi) / cfg.focal_loss_init_pi)
-                    else:
-                        module.bias.data.zero_()
-    
-    def train(self, mode=True):
-        super().train(mode)
-
-        if cfg.freeze_bn:
-            self.freeze_bn()
-
-    def freeze_bn(self, enable=False):
-        """ Adapted from https://discuss.pytorch.org/t/how-to-train-with-frozen-batchnorm/12106/8 """
-        for module in self.modules():
-            if isinstance(module, nn.BatchNorm2d):
-                module.train() if enable else module.eval()
-
-                module.weight.requires_grad = enable
-                module.bias.requires_grad = enable
     
     def forward(self, x):
         """ The input should be of size [batch_size, 3, img_h, img_w] """
