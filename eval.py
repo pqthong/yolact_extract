@@ -9,7 +9,6 @@ import torch
 import torch.backends.cudnn as cudnn
 import argparse
 import random
-import os
 import cv2
 
 def str2bool(v):
