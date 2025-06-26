@@ -7,16 +7,18 @@ from itertools import product
 from math import sqrt
 from typing import List
 from collections import defaultdict
+from utils.augmentations import FastBaseTransform
 
 from data.config import cfg, mask_type
 from layers import Detect
 from layers.interpolate import InterpolateModule
 from backbone import construct_backbone
+from layers.output_utils import postprocess
 
 import torch.backends.cudnn as cudnn
 from utils import timer
 from utils.functions import MovingAverage, make_net
-
+import cv2
 # This is required for Pytorch 1.0.1 on Windows to initialize Cuda on some driver versions.
 # See the bug report here: https://github.com/pytorch/pytorch/issues/17108
 torch.cuda.current_device()
@@ -396,7 +398,7 @@ class Yolact(nn.Module):
         - pred_aspect_ratios: A list of lists of aspect ratios with len(selected_layers) (see PredictionModule)
     """
 
-    def __init__(self):
+    def __init__(self, model_path=None):
         super().__init__()
 
         self.backbone = construct_backbone(cfg.backbone)
@@ -469,6 +471,9 @@ class Yolact(nn.Module):
         # For use in evaluation
         self.detect = Detect(cfg.num_classes, bkg_label=0, top_k=cfg.nms_top_k,
             conf_thresh=cfg.nms_conf_thresh, nms_thresh=cfg.nms_thresh)
+        self.load_weights(model_path)
+        self.eval() 
+        self.cuda()
 
     def save_weights(self, path):
         """ Saves the model's weights using compression because the file sizes were getting too big. """
@@ -676,49 +681,26 @@ class Yolact(nn.Module):
             return self.detect(pred_outs, self)
 
 
+    def infer(self, path_in, threadhold=0.1, top_k=100):
+        with torch.no_grad():
+            cudnn.fastest = True
+            torch.set_default_tensor_type('torch.cuda.FloatTensor')
+
+            self.detect.use_fast_nms = True
+            self.detect.use_cross_class_nms = True
+            cfg.mask_proto_debug = False
+
+            frame = torch.from_numpy(cv2.imread(path_in)).cuda().float()
+            batch = FastBaseTransform()(frame.unsqueeze(0))
+            preds = self(batch)
+            h, w, _ = frame.shape
+            t = postprocess(preds, w, h, visualize_lincomb = False,
+                                            crop_masks        = False,
+                                            score_threshold   = threadhold)
+            idx = t[1].argsort(0, descending=True)[:top_k]
+            classes, scores, boxes = [x[idx].cpu().numpy() for x in t[:3]]  
+            print('Classes:', classes)  
+            print('Scores:', scores)
+            print('Boxes:', boxes)
 
 
-# Some testing code
-if __name__ == '__main__':
-    from utils.functions import init_console
-    init_console()
-
-    # Use the first argument to set the config if you want
-    import sys
-    if len(sys.argv) > 1:
-        from data.config import set_cfg
-        set_cfg(sys.argv[1])
-
-    net = Yolact()
-    net.train()
-    net.init_weights(backbone_path='weights/' + cfg.backbone.path)
-
-    # GPU
-    net = net.cuda()
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
-
-    x = torch.zeros((1, 3, cfg.max_size, cfg.max_size))
-    y = net(x)
-
-    for p in net.prediction_layers:
-        print(p.last_conv_size)
-
-    print()
-    for k, a in y.items():
-        print(k + ': ', a.size(), torch.sum(a))
-    exit()
-    
-    net(x)
-    # timer.disable('pass2')
-    avg = MovingAverage()
-    try:
-        while True:
-            timer.reset()
-            with timer.env('everything else'):
-                net(x)
-            avg.add(timer.total_time())
-            print('\033[2J') # Moves console cursor to 0,0
-            timer.print_stats()
-            print('Avg fps: %.2f\tAvg ms: %.2f         ' % (1/avg.get_avg(), avg.get_avg()*1000))
-    except KeyboardInterrupt:
-        pass
